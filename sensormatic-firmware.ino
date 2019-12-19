@@ -11,6 +11,10 @@
 #define CSN_PIN PIN_A3
 #endif
 
+#define THIS_DEVICE_TYPE 5 // Sensormatic
+#define EVENT_CURRENT_TEMP 1 // Current Temp
+#define EVENT_SET_TEMP 2 // New Set Temp
+
 #define DS18B20_PIN 2 // PIN_B2
 
 #include "PinChangeInterrupt.h"
@@ -25,6 +29,12 @@
 #define DETECT_SHORT_MS 5
 #define DETECT_LONG_MS 1000
 //#define DETECT_DOUBLE_MS 400
+
+struct event_t {
+  byte device_type;
+  byte event_type;
+  uint16_t temp;
+};
 
 
 //volatile byte pressStateA = PRESS_STATE_IDLE;
@@ -100,11 +110,13 @@ void storeCounter() {
   EEPROM.update(addr, counter);  
 }
 // uint32_t
-void publishMsg(uint16_t data) {
+void publishMsg(byte event_type, int data) {
   //debugOut(60);
   //debugOut(61);
+  event_t rf_event = { THIS_DEVICE_TYPE, event_type, data };
+  
   #ifdef WIRELESS
-  if (!mesh.write(&data, 'M', sizeof(data))) {
+  if (!mesh.write(&rf_event, 'M', sizeof(rf_event))) {
     // If a write fails, check connectivity to the mesh network
     //debugOut(70);
     if ( !mesh.checkConnection() ) {
@@ -235,7 +247,7 @@ void loop() {
         counter--;
         showDigits(counter);
         storeCounter();
-        publishMsg((uint32_t) counter);
+        publishMsg(EVENT_SET_TEMP, (uint16_t) counter);
         _delay_ms(500);
       }
     } else {
@@ -263,7 +275,7 @@ void loop() {
         counter++;
         showDigits(counter);
         storeCounter();
-        publishMsg((uint32_t) counter);
+        publishMsg(EVENT_SET_TEMP, (uint16_t) counter);
         _delay_ms(500);
       //}
     } else {
@@ -298,13 +310,14 @@ void loop() {
   
   showDigits((byte) t);
   
-  publishMsg((uint16_t) t);
+  publishMsg(EVENT_CURRENT_TEMP, (uint16_t) t);
   }
     // currentTemperature = (unsigned long) read_temperature();
     //showDigits((byte) currentTemperature);
     //publishMsg(currentTemperature);
   //}
 
+/*
   #ifdef WIRELESS
   while (network.available()) {
     RF24NetworkHeader header;
@@ -316,4 +329,5 @@ void loop() {
     //Serial.println(payload.ms);
   }
   #endif
+  */
 }
