@@ -1,19 +1,22 @@
 #include "i2c.c"
 #include "onewire.c"
 #include "onewire.h"
-#define WIRELESS 1
 
-#ifdef WIRELESS
 #include "RF24.h"
 #include "RF24Network.h"
 #include "RF24Mesh.h"
 #define CE_PIN PIN_B1
 #define CSN_PIN PIN_A3
-#endif
 
-#define THIS_DEVICE_TYPE 5 // Sensormatic
+#define DEVICE_TYPE_CASAMATIC 1
+#define THIS_DEVICE_TYPE 2 // Sensormatic
+
+#define CASAMATIC_EVENT_DEVICE_ADDED 1
+
+#define EVENT_LINK_PRESENT 0 // Link
 #define EVENT_CURRENT_TEMP 1 // Current Temp
 #define EVENT_SET_TEMP 2 // New Set Temp
+#define EVENT_SET_MODE 3 // Set mode
 
 #define DS18B20_PIN 2 // PIN_B2
 
@@ -23,311 +26,284 @@
 #define PIN_PULSADOR_B PIN_A1
 #define PIN_PULSADOR_C PIN_A0
 
+const byte pulsadores[] = { PIN_PULSADOR_A, PIN_PULSADOR_B, PIN_PULSADOR_C };
+
 #define PRESS_STATE_IDLE 0
 #define PRESS_STATE_STARTED 1
 
 #define DETECT_SHORT_MS 5
 #define DETECT_LONG_MS 1000
-//#define DETECT_DOUBLE_MS 400
+#define DETECT_DOUBLE_MS 400
+
+#define DEBUG 1
 
 struct event_t {
+  char from[6];
   byte device_type;
   byte event_type;
-  uint16_t temp;
+  char to[6];
+  byte data;
 };
 
+uint32_t currentMillis = 0;
 
-//volatile byte pressStateA = PRESS_STATE_IDLE;
-volatile byte pressStateB = PRESS_STATE_IDLE;
-volatile byte pressStateC = PRESS_STATE_IDLE;
+volatile byte pressState[3]  = {PRESS_STATE_IDLE, PRESS_STATE_IDLE, PRESS_STATE_IDLE};
+volatile unsigned long initPressMillis[3] = {0, 0, 0};
+volatile unsigned long prevPressMillis[3] = {0, 0, 0};
+unsigned long diffMillis[3] = {0, 0, 0};
 
-//volatile unsigned long initPressMillisA = 0;
-volatile unsigned long initPressMillisB = 0;
-volatile unsigned long initPressMillisC = 0;
+#define STATE_BOOT 0
+#define STATE_ERROR 1
+#define STATE_LINK 2
+#define STATE_ACTIVE 3
+#define STATE_CLEAR 4
 
-//volatile unsigned long prevPressMillisA = 0;
-volatile unsigned long prevPressMillisB = 0;
-volatile unsigned long prevPressMillisC = 0;
+byte CURRENT_STATE = STATE_BOOT;
 
-//unsigned long diffMillisA = 0;
-unsigned long diffMillisB = 0;
-unsigned long diffMillisC = 0;
+#define MODE_HEAT 0
+#define MODE_COLD 1
 
-//////////////
+byte CURRENT_MODE = MODE_HEAT;
 
-/*void setPulsadorA(void) {
-  if (pressStateA == PRESS_STATE_IDLE) {
-    byte pinState;
-    pinState = (PINA >> PIN_PULSADOR_A)& 1;
-    if (pinState == 1) {
-      pressStateA = PRESS_STATE_STARTED;
-      initPressMillisA = millis();
-    }
-  }
-}*/
-
-void setPulsadorB(void) {
-  if (pressStateB == PRESS_STATE_IDLE) {
-    byte pinState;
-    pinState = (PINA >> PIN_PULSADOR_B)& 1;
-    if (pinState == 1) {
-      pressStateB = PRESS_STATE_STARTED;
-      initPressMillisB = millis();
+void setPulsador(byte i) {
+  if (pressState[i] == PRESS_STATE_IDLE) {
+    if (((PINA >> pulsadores[i])& 1) == 1) {
+      pressState[i] = PRESS_STATE_STARTED;
+      initPressMillis[i] = millis();
     }
   }
 }
 
-void setPulsadorC(void) {
-  if (pressStateC == PRESS_STATE_IDLE) {
-    //byte pinState;
-    //pinState = (PINA >> PIN_PULSADOR_C)& 1;
-    if (((PINA >> PIN_PULSADOR_C)& 1) == 1) {
-      pressStateC = PRESS_STATE_STARTED;
-      //initPressMillisC = millis();
-    }
-  }
-}
+void setPulsadorA(void) { setPulsador(0); }
+void setPulsadorB(void) { setPulsador(1); }
+void setPulsadorC(void) { setPulsador(2); }
 
 #include <EEPROM.h>
-int addr = 0;
-
-volatile byte counter = 0;
+#include "EEPROMAnything.h"
+#define EEPROM_ADDR_STATE 0
+#define EEPROM_ADDR_MAC 1
+#define EEPROM_ADDR_TEMP_SET 10
+char mac[6] = { 0 };
+volatile byte tempSet = 0;
 
 uint32_t publishTimer = 0;
 
-struct payload_t {
-  unsigned long ms;
-  unsigned long counter;
-};
-
-#ifdef WIRELESS
 RF24 radio(CE_PIN, CSN_PIN);
 RF24Network network(radio);
 RF24Mesh mesh(radio, network);
-#endif
 
 void storeCounter() {
-  EEPROM.update(addr, counter);  
-}
-// uint32_t
-void publishMsg(byte event_type, int data) {
-  //debugOut(60);
-  //debugOut(61);
-  event_t rf_event = { THIS_DEVICE_TYPE, event_type, data };
-  
-  #ifdef WIRELESS
-  if (!mesh.write(&rf_event, 'M', sizeof(rf_event))) {
-    // If a write fails, check connectivity to the mesh network
-    //debugOut(70);
-    if ( !mesh.checkConnection() ) {
-      //refresh the network address
-      //Serial.println("Renewing Address");
-      //debugOut(71);
-      if (!mesh.renewAddress(1000)) {
-        //debugOut(72);
-        //If address renewal fails, reconfigure the radio and restart the mesh
-        //This allows recovery from most if not all radio errors
-        mesh.begin(40, RF24_250KBPS, 1000);
-      }
-    } else {
-      //debugOut(80);
-      //Serial.println("Send fail, Test OK");
-    }
-  } else {
-    //debugOut(69);
-    //Serial.print("Send OK: ");
-  }
-  #endif
+  EEPROM.update(EEPROM_ADDR_TEMP_SET, tempSet);
 }
 
+void publishMsg(byte event_type, int data) {
+  char to[6] = { '0', '0', '0', '0', '0', '0' };
+  event_t rf_event;
+  rf_event.device_type = THIS_DEVICE_TYPE;
+  rf_event.event_type = event_type;
+  rf_event.data = data;
+  memcpy(rf_event.from, mac, sizeof(char) * 6);
+  memcpy(rf_event.to, to, sizeof(char) * 6);
+
+  bool ok = false;
+
+  ok = mesh.write(&rf_event, 'M', sizeof(rf_event));
+  if (!ok) {
+    // If a write fails, check connectivity to the mesh network
+    #ifdef DEBUG
+    debugOut(70);
+    #endif
+    if ( !mesh.checkConnection() ) {
+      //refresh the network address
+      //#ifdef DEBUG
+      //debugOut(71);
+      //#endif
+      if (!mesh.renewAddress(1000)) {
+        //#ifdef DEBUG
+        //debugOut(72);
+        //#endif
+        //If address renewal fails, reconfigure the radio and restart the mesh
+        //This allows recovery from most if not all radio errors
+        mesh.begin(40, RF24_250KBPS, 2000);
+      }
+    } else {
+      //#ifdef DEBUG
+      //debugOut(80);
+      //#endif
+    }
+  } else {
+    #ifdef DEBUG
+    debugOut(69);
+    #endif
+  }
+}
+
+#ifdef DEBUG
 void debugOut(byte value) {
   showDigits(value);
   _delay_ms(500);
 }
+#endif
 
 /////////////////////////////
 
 uint32_t currentTemperature = 0;
 
+void loadConfig() {
+  byte state = EEPROM.read(EEPROM_ADDR_STATE);
+  EEPROM_readAnything(EEPROM_ADDR_MAC, mac);
+  
+  switch (state) {
+    case STATE_ACTIVE:
+      CURRENT_STATE = STATE_ACTIVE;
+      break;
+    default:
+      CURRENT_STATE = STATE_LINK;
+  }
+}
+
 void setup() {
-  #ifdef WIRELESS
   pinMode(CE_PIN, OUTPUT);
   pinMode(CSN_PIN, OUTPUT);
-  #endif
   pinMode(PIN_PULSADOR_A, INPUT);
   pinMode(PIN_PULSADOR_B, INPUT);
   pinMode(PIN_PULSADOR_C, INPUT);
   pinMode(DS18B20_PIN, INPUT);
 
+  // Run only once
+  //char m[6] = {'a', 'b', 'c', '1', '2', '3'};
+  //EEPROM_writeAnything(EEPROM_ADDR_MAC, m);
+  
+  loadConfig();
+
   init_i2c(); // https://github.com/szczys/avr-i2c/tree/master/bitbang
   onewire_init(DS18B20_PIN);
 
   showDigits(88);
-
-  //attachPCINT(digitalPinToPCINT(PIN_PULSADOR_A), setPulsadorA, RISING);
+  
+  attachPCINT(digitalPinToPCINT(PIN_PULSADOR_A), setPulsadorA, RISING);
   attachPCINT(digitalPinToPCINT(PIN_PULSADOR_B), setPulsadorB, RISING);
   attachPCINT(digitalPinToPCINT(PIN_PULSADOR_C), setPulsadorC, RISING);
 
-  showDigits(0);
-
-  #ifdef WIRELESS
-  radio.setPALevel(RF24_PA_MAX);
-  mesh.begin(40, RF24_250KBPS, 1000);
-  showDigits(1);
-  #endif
-
-  counter = EEPROM.read(addr);
-  showDigits(2);
-  
-  /*GIMSK |= _BV(PCIE0);   // Enable Pin Change Interrupts
-  //PCMSK0 |= _BV(PCINT0); // Use PA0 as interrupt pin
-
-  PCMSK0 |= _BV(PCINT0); // PA0
-  PCMSK0 |= _BV(PCINT1); // PA1
-  PCMSK0 |= _BV(PCINT3); // PA3
-
-  // MCUCR &= ~(_BV(ISC01) | _BV(ISC00));
-  MCUCR |= (_BV(ISC01) | _BV(ISC00));
-  
-  sei(); //Enable interrupts*/
+  if ((CURRENT_STATE == STATE_ACTIVE) || (CURRENT_STATE == STATE_LINK)) {
+    tempSet = EEPROM.read(EEPROM_ADDR_TEMP_SET);
+    radio.setPALevel(RF24_PA_MAX);
+    mesh.begin(40, RF24_250KBPS, 1000);
+  }
 }
 
 void loop() {
-  #ifdef WIRELESS
   mesh.update();
-  #endif
+    
+  if (CURRENT_STATE == STATE_LINK) {
+    //mesh.update();
+
+    while (network.available()) {
+      showDigits(15);
+      _delay_ms(200);
+      
+      RF24NetworkHeader header;
+      event_t payload;
+      network.read(header, &payload, sizeof(payload));
+
+      if (strcmp(payload.to, mac) == 0) {
+        showDigits(16);
+        _delay_ms(200);
+        if (payload.device_type == DEVICE_TYPE_CASAMATIC) {
+          if (payload.event_type == CASAMATIC_EVENT_DEVICE_ADDED) {
+            EEPROM.update(EEPROM_ADDR_STATE, STATE_ACTIVE);
+            CURRENT_STATE = STATE_ACTIVE;
+          }  
+        }
+      } else {
+        //showDigits(18);
+      }
+    }
+    
+    currentMillis = millis();
+    
+    if (currentMillis - publishTimer >= 10000) {
+      publishTimer = currentMillis;
+
+      showDigits(0);
+      
+      publishMsg(EVENT_LINK_PRESENT, 0);
+    }
+  } else if (CURRENT_STATE == STATE_ACTIVE) {
+    currentMillis = millis();
+
+    for(byte i = 0; i < 3; i++) {
+      if (pressState[i] == PRESS_STATE_STARTED) {
+        diffMillis[i] = currentMillis - initPressMillis[i];
+    
+        if (((PINA >> pulsadores[i])& 1) == 0) {
+          //if ((initPressMillis[i] - prevPressMillis[i]) < DETECT_DOUBLE_MS) {
+          //  prevPressMillis[i] = 0;
+          //  initPressMillis[i] = 0;
+          //  showDigits(40 + i);
+          //  _delay_ms(300);
+          //} else
+          if (diffMillis[i] >= DETECT_SHORT_MS && diffMillis[i] < DETECT_LONG_MS) {
+            prevPressMillis[i] = initPressMillis[i];
+            initPressMillis[i] = 0;
+
+            switch(i) {
+              case 0:
+                if (CURRENT_MODE == 0) {
+                  CURRENT_MODE = 1;
+                } else {
+                  CURRENT_MODE = 0;
+                }
+                publishMsg(EVENT_SET_MODE, CURRENT_MODE);
+                break;
+              case 1:
+                tempSet--;
+                showDigits(tempSet);
+                storeCounter();
+                publishMsg(EVENT_SET_TEMP, (uint16_t) tempSet);
+                _delay_ms(300);
+                break;
+              case 2:
+                tempSet++;
+                showDigits(tempSet);
+                storeCounter();
+                publishMsg(EVENT_SET_TEMP, (uint16_t) tempSet);
+                _delay_ms(300);
+            }
+          }
+          pressState[i] = PRESS_STATE_IDLE;
+        } else {
+          if (diffMillis[i] > DETECT_LONG_MS) {
+            pressState[i] = PRESS_STATE_IDLE;
+            initPressMillis[i] = 0;
+            prevPressMillis[i] = 0;
+
+            showDigits(50 + i);
+            _delay_ms(300);
+          }
+        }
+      }
+    }
+
+    if (currentMillis - publishTimer >= 5000) {
+      publishTimer = currentMillis;
+
+      uint16_t t;
+      onewire_reset(); // 1-Wire reset
+      onewire_write(ONEWIRE_SKIP_ROM); // to all devices on the bus
+      onewire_write(0x44); // send DS18B20 command, "CONVERT T"
+
+      onewire_reset(); // 1-Wire reset
+      onewire_write(ONEWIRE_SKIP_ROM); // to all devices on the bus
+      onewire_write(0xBE); // send DS18B20 command, "READ SCRATCHPAD"
+
+      t = onewire_read(); // read temperature low byte
+      t |= (uint16_t)onewire_read() << 8; // and high byte
+      t = ((t >> 4) * 100 + ((t << 12) / 6553) * 10) / 100; // decode temp
   
-  //if (pressStateA == PRESS_STATE_STARTED) {
-  //  diffMillisA = millis() - initPressMillisA;
-    
-  //  if (digitalRead(PIN_PULSADOR_A) == LOW) {
-      /*if ((initPressMillisA - prevPressMillisA) < DETECT_DOUBLE_MS) {
-        prevPressMillisA = 0;
-        initPressMillisA = 0;
-        pressStateA = PRESS_STATE_IDLE;
-
-        // increaseCounter();
-        // blinkT(1, 150);
-        counter = 24;
-      } else {*/
-  //      if (diffMillisA >= DETECT_SHORT_MS && diffMillisA < DETECT_LONG_MS) {
-  //        prevPressMillisA = initPressMillisA;
-
-  //        initPressMillisA = 0;
-  //        pressStateA = PRESS_STATE_IDLE;
-
-  //        counter = 24;
-  //        showDigits(counter);
-          // blinkFromCounter();
-  //      }
-      // }
-  //  } else {
-      /*if (diffMillis > DETECT_LONG_MS) {
-        pressState = PRESS_STATE_IDLE;
-        initPressMillis = 0;
-        prevPressMillis = 0;
-
-        resetCounter();
-        blinkT(1, 500);
-      }
-      */
-  // }
-  //}
-
-  if (pressStateB == PRESS_STATE_STARTED) {
-    diffMillisB = millis() - initPressMillisB;
-    
-    if (digitalRead(PIN_PULSADOR_B) == LOW) {
-      if (diffMillisB >= DETECT_SHORT_MS && diffMillisB < DETECT_LONG_MS) {
-        prevPressMillisB = initPressMillisB;
-
-        initPressMillisB = 0;
-        pressStateB = PRESS_STATE_IDLE;
-
-        counter--;
-        showDigits(counter);
-        storeCounter();
-        publishMsg(EVENT_SET_TEMP, (uint16_t) counter);
-        _delay_ms(500);
-      }
-    } else {
-      //if (diffMillisC > DETECT_LONG_MS) {
-        //pressState = PRESS_STATE_IDLE;
-        //initPressMillis = 0;
-        //prevPressMillis = 0;
-
-        //resetCounter();
-        //blinkT(1, 500);
-      //}
+      showDigits((byte) t);
+  
+      publishMsg(EVENT_CURRENT_TEMP, (uint16_t) t);
     }
   }
-
-  if (pressStateC == PRESS_STATE_STARTED) {
-    //diffMillisC = millis() - initPressMillisC;
-    
-    if (digitalRead(PIN_PULSADOR_C) == LOW) {
-      //if (diffMillisC >= DETECT_SHORT_MS && diffMillisC < DETECT_LONG_MS) {
-        //prevPressMillisC = initPressMillisC;
-
-        //initPressMillisC = 0;
-        pressStateC = PRESS_STATE_IDLE;
-
-        counter++;
-        showDigits(counter);
-        storeCounter();
-        publishMsg(EVENT_SET_TEMP, (uint16_t) counter);
-        _delay_ms(500);
-      //}
-    } else {
-      /*if (diffMillis > DETECT_LONG_MS) {
-        pressState = PRESS_STATE_IDLE;
-        initPressMillis = 0;
-        prevPressMillis = 0;
-
-        resetCounter();
-        blinkT(1, 500);
-      }*/
-    }
-  }
-
-  // _delay_ms(500);
-
-  if (millis() - publishTimer >= 5000) {
-    publishTimer = millis();
-
-  uint16_t t;
-	onewire_reset(); // 1-Wire reset
-	onewire_write(ONEWIRE_SKIP_ROM); // to all devices on the bus
-	onewire_write(0x44); // send DS18B20 command, "CONVERT T"
-
-	onewire_reset(); // 1-Wire reset
-	onewire_write(ONEWIRE_SKIP_ROM); // to all devices on the bus
-	onewire_write(0xBE); // send DS18B20 command, "READ SCRATCHPAD"
-
-	t = onewire_read(); // read temperature low byte
-	t |= (uint16_t)onewire_read() << 8; // and high byte
-	t = ((t >> 4) * 100 + ((t << 12) / 6553) * 10) / 100; // decode temp
-  
-  showDigits((byte) t);
-  
-  publishMsg(EVENT_CURRENT_TEMP, (uint16_t) t);
-  }
-    // currentTemperature = (unsigned long) read_temperature();
-    //showDigits((byte) currentTemperature);
-    //publishMsg(currentTemperature);
-  //}
-
-/*
-  #ifdef WIRELESS
-  while (network.available()) {
-    RF24NetworkHeader header;
-    payload_t payload;
-    network.read(header, &payload, sizeof(payload));
-    //Serial.print("Received packet #");
-    //Serial.print(payload.counter);
-    //Serial.print(" at ");
-    //Serial.println(payload.ms);
-  }
-  #endif
-  */
 }
