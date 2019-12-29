@@ -1,12 +1,13 @@
-#include "i2c.c"
-#include "onewire.c"
-#include "onewire.h"
-
 #include "RF24.h"
 #include "RF24Network.h"
 #include "RF24Mesh.h"
 #define CE_PIN PIN_B1
 #define CSN_PIN PIN_A3
+#define RF_CHANNEL 44
+
+#include "i2c.c"
+#include "onewire.c"
+#include "onewire.h"
 
 #define DEVICE_TYPE_CASAMATIC 1
 #define THIS_DEVICE_TYPE 2 // Sensormatic
@@ -32,16 +33,16 @@ const byte pulsadores[] = { PIN_PULSADOR_A, PIN_PULSADOR_B, PIN_PULSADOR_C };
 #define PRESS_STATE_STARTED 1
 
 #define DETECT_SHORT_MS 5
-#define DETECT_LONG_MS 1000
+#define DETECT_LONG_MS 2000
 #define DETECT_DOUBLE_MS 400
 
-#define DEBUG 1
+//#define DEBUG 1
 
 struct event_t {
-  char from[6];
+  char from[5];
   byte device_type;
   byte event_type;
-  char to[6];
+  char to[5];
   byte data;
 };
 
@@ -83,7 +84,7 @@ void setPulsadorC(void) { setPulsador(2); }
 #define EEPROM_ADDR_STATE 0
 #define EEPROM_ADDR_MAC 1
 #define EEPROM_ADDR_TEMP_SET 10
-char mac[6] = { 0 };
+char mac[5] = { 0 };
 volatile byte tempSet = 0;
 
 uint32_t publishTimer = 0;
@@ -97,22 +98,21 @@ void storeCounter() {
 }
 
 void publishMsg(byte event_type, int data) {
-  char to[6] = { '0', '0', '0', '0', '0', '0' };
+  char to[5] = { 'f', 'f', 'f', 'f', 0 };
   event_t rf_event;
   rf_event.device_type = THIS_DEVICE_TYPE;
   rf_event.event_type = event_type;
   rf_event.data = data;
-  memcpy(rf_event.from, mac, sizeof(char) * 6);
-  memcpy(rf_event.to, to, sizeof(char) * 6);
+  memcpy(rf_event.from, mac, sizeof(char) * 5);
+  memcpy(rf_event.to, to, sizeof(char) * 5);
 
-  bool ok = false;
-
-  ok = mesh.write(&rf_event, 'M', sizeof(rf_event));
-  if (!ok) {
+  if (!mesh.write(&rf_event, 'M', sizeof(rf_event))) {
     // If a write fails, check connectivity to the mesh network
     #ifdef DEBUG
     debugOut(70);
     #endif
+    showDigits(70); // TODO For troubleshooting, remove later
+    _delay_ms(500);
     if ( !mesh.checkConnection() ) {
       //refresh the network address
       //#ifdef DEBUG
@@ -124,7 +124,7 @@ void publishMsg(byte event_type, int data) {
         //#endif
         //If address renewal fails, reconfigure the radio and restart the mesh
         //This allows recovery from most if not all radio errors
-        mesh.begin(40, RF24_250KBPS, 2000);
+        mesh.begin(RF_CHANNEL, RF24_250KBPS, 1000);
       }
     } else {
       //#ifdef DEBUG
@@ -163,20 +163,22 @@ void loadConfig() {
 }
 
 void setup() {
-  pinMode(CE_PIN, OUTPUT);
-  pinMode(CSN_PIN, OUTPUT);
+  //pinMode(CE_PIN, OUTPUT);
+  //pinMode(CSN_PIN, OUTPUT);
+
   pinMode(PIN_PULSADOR_A, INPUT);
   pinMode(PIN_PULSADOR_B, INPUT);
   pinMode(PIN_PULSADOR_C, INPUT);
   pinMode(DS18B20_PIN, INPUT);
 
   // Run only once
-  //char m[6] = {'a', 'b', 'c', '1', '2', '3'};
+  //char m[5] = {'a', 'b', '1', '2', 0};
   //EEPROM_writeAnything(EEPROM_ADDR_MAC, m);
   
   loadConfig();
 
   init_i2c(); // https://github.com/szczys/avr-i2c/tree/master/bitbang
+  
   onewire_init(DS18B20_PIN);
 
   showDigits(88);
@@ -185,10 +187,12 @@ void setup() {
   attachPCINT(digitalPinToPCINT(PIN_PULSADOR_B), setPulsadorB, RISING);
   attachPCINT(digitalPinToPCINT(PIN_PULSADOR_C), setPulsadorC, RISING);
 
+  CURRENT_STATE = STATE_LINK;
+
   if ((CURRENT_STATE == STATE_ACTIVE) || (CURRENT_STATE == STATE_LINK)) {
     tempSet = EEPROM.read(EEPROM_ADDR_TEMP_SET);
     radio.setPALevel(RF24_PA_MAX);
-    mesh.begin(40, RF24_250KBPS, 1000);
+    mesh.begin(RF_CHANNEL, RF24_250KBPS, 1000);
   }
 }
 
@@ -196,19 +200,12 @@ void loop() {
   mesh.update();
     
   if (CURRENT_STATE == STATE_LINK) {
-    //mesh.update();
-
     while (network.available()) {
-      showDigits(15);
-      _delay_ms(200);
-      
       RF24NetworkHeader header;
       event_t payload;
       network.read(header, &payload, sizeof(payload));
 
       if (strcmp(payload.to, mac) == 0) {
-        showDigits(16);
-        _delay_ms(200);
         if (payload.device_type == DEVICE_TYPE_CASAMATIC) {
           if (payload.event_type == CASAMATIC_EVENT_DEVICE_ADDED) {
             EEPROM.update(EEPROM_ADDR_STATE, STATE_ACTIVE);
@@ -216,7 +213,7 @@ void loop() {
           }  
         }
       } else {
-        //showDigits(18);
+        // showDigits(18);
       }
     }
     
@@ -278,8 +275,13 @@ void loop() {
             initPressMillis[i] = 0;
             prevPressMillis[i] = 0;
 
-            showDigits(50 + i);
-            _delay_ms(300);
+            if (i == 0) {
+              EEPROM.update(EEPROM_ADDR_STATE, STATE_LINK);
+              CURRENT_STATE = STATE_LINK;
+            } else {
+              showDigits(50 + i);
+              _delay_ms(300);
+            }
           }
         }
       }
